@@ -12,8 +12,24 @@ bl_info = {
 
 
 import bpy
-import subprocess
 import importlib
+import mathutils
+import numpy
+import subprocess
+import time
+
+#from .bfm import FiducialMarkerDetector
+from .bfm_native import FiducialMarkerDetectorNative as Detector
+try:
+    from .bfm_native import FiducialMarkerDetectorNative as Detector
+except ImportError as e:
+    print(f"Could not import native fiducial marker library - probably missing OpenCV - falling back to pure Python.  Exception: {e}")
+    from .bfm_python import FiducialMarkerDetectorPython as Detector
+
+MARKER_PREFIX = "BFM_MARKER_"
+
+# Debug breakpoint in Blender:
+#__import__('code').interact(local=dict(globals(), **locals()))
 
 # Frustratingly, making these a collection to prevent namespace pollution changes the way we have to access them.
 # As a bpy.types.Scene.bfm_config = bpy.props.CollectionProperty(type=BFM_PGT_TrackingConfiguration) we have to do settings = bpy.context.scene.bfm_config.add(); settings.whatever
@@ -31,11 +47,9 @@ class BFM_PGT_TrackingConfiguration(bpy.types.PropertyGroup):
     output_collection: bpy.props.PointerProperty(type=bpy.types.Collection, name="Collection") # type: ignore
     marker_size_mm: bpy.props.FloatProperty(name="Marker Size (mm)", description="The side-length of a marker in millimeters.")  # type: ignore
     origin_marker: bpy.props.IntProperty(name="Origin Marker ID", default=0)  # type: ignore
-    x_marker: bpy.props.IntProperty(name="+X Marker ID", default=0)  # type: ignore
-    y_marker: bpy.props.IntProperty(name="+Y Marker ID", default=0)  # type: ignore
     generate_2d_tracks: bpy.props.BoolProperty(name="Generate 2D Tracking Markers", default=False, description="Generate 2D tracks in addition to the 3D empties.")  # type: ignore
     empties_at_center: bpy.props.BoolProperty(name="Empties at Center", default=True, description="If true, generates empties at the center of the detected markers, else generates them at the top-left corner.")  # type: ignore
-    dictionary: bpy.props.StringProperty(name="Fiducial Dictionary")  # type: ignore
+    dictionary: bpy.props.StringProperty(name="Fiducial Dictionary", default="ARUCO_DEFAULT")  # type: ignore
 
     @classmethod
     def register(cls):
@@ -48,7 +62,6 @@ class BFM_PGT_TrackingConfiguration(bpy.types.PropertyGroup):
     @classmethod
     def unregister(cls):
         del bpy.types.Scene.bfm_settings
-
     
 # UI:
 
@@ -70,11 +83,9 @@ class BFM_PT_TrackingPanel(bpy.types.Panel):
         col = layout.column(heading="Space Configuration", align=True)
         col.prop(context.scene.bfm_settings, "marker_size_mm", text="Marker Size (mm)")
         col.prop(context.scene.bfm_settings, "origin_marker", text="Origin Marker ID")
-        col.prop(context.scene.bfm_settings, "x_marker", text="+X Marker ID")
-        col.prop(context.scene.bfm_settings, "y_marker", text="+Y Marker ID")
 
         col = layout.column(heading="Markers", align=True)
-        col.prop(context.scene.bfm_settings, "dictionary", text="Dictionary")
+        col.prop(context.scene.bfm_settings, "dictionary", text="Dictionary")  # TODO: Make this an enum
         col.prop(context.scene.bfm_settings, "generate_2d_tracks", text="Generate 2D Tracks")
         col.prop(context.scene.bfm_settings, "empties_at_center", text="Empties at Center")
 
@@ -116,7 +127,7 @@ def iterate_video_frames(
         data: bpy.types.BlendData,
         movie_clip: bpy.types.MovieClip | str | None = None, 
         start_frame: int | None = None, 
-        end_frame: int | None = None
+        end_frame: int | None = None,
     ):
     """
     Returns an iterator that yields arrays of pixel data for each frame of the specified movie clip.
@@ -181,6 +192,9 @@ def iterate_video_frames(
     #>>> context.screen.areas[2].spaces[0].image.pixels[0]
     image = data.images.load(movie_clip.filepath)
     viewer_space.image = image
+    image_width = image.size[0]
+    image_height = image.size[1]
+    channels = 4  # image space is always exported as 4 bytes?
     for frame_idx in range(start_frame, end_frame):
         viewer_space.image_user.frame_offset = frame_idx
         
@@ -188,7 +202,10 @@ def iterate_video_frames(
         viewer_space.display_channels = 'COLOR_ALPHA'
         viewer_space.display_channels = 'COLOR'
 
-        yield(viewer_space.image.pixels)
+        image_data = numpy.array(viewer_space.image.pixels).reshape((image_height, image_width, channels))
+        # Because we can't have nice things, the image is also inverted.
+        image_data = image_data[::-1,:,:]
+        yield(image_data)
 
         #pixels = list(viewer_space.image.pixels)
         #tmp = bpy.data.images.new(name="sample"+str(frame), width=w, height=h, alpha=False, float_buffer=False)
@@ -226,6 +243,15 @@ class BFM_OT_Track(bpy.types.Operator):
     bl_description = "Process the current clip, animating empties to match."
     bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        if context.space_data.type != "CLIP_EDITOR":
+            return False
+        if context.edit_movieclip is None:
+            return False
+        
+        return True
+
     def execute(self, context):
         # Ensure we are in the Tracking context
         space = context.space_data
@@ -239,6 +265,12 @@ class BFM_OT_Track(bpy.types.Operator):
             self.report({'ERROR'}, "No active clip found!")
             return {'CANCELLED'}
         
+        config: BFM_PGT_TrackingConfiguration = context.scene.bfm_settings
+
+        if config.marker_size_mm <= 0.0:
+            self.report({'ERROR'}, "Marker size should be greater than zero.")
+            return {'CANCELLED'}
+
         #self.report(
         #    {'INFO'}, "F: {:.2f}  B: {:s}  S: {!r}".format(
         #        self.my_float, self.my_bool, self.my_string,
@@ -255,25 +287,80 @@ class BFM_OT_Track(bpy.types.Operator):
         #current_frame = bpy.data.scenes['Scene'].frame_current
         #current_frame = context.scene.frame_current
 
-        for frame_idx, pixel_data in enumerate(iterate_video_frames(context, bpy.data, clip)):
-            self.report({'INFO'}, f"Processing frame {frame_idx} with {len(pixel_data)} pixels")
-            #__import__('code').interact(local=dict(globals(), **locals()))
+        
+        fm = Detector(
+            marker_size_mm=config.marker_size_mm, 
+            downsample_to=(1920, 1080), 
+            dictionary=config.dictionary, 
+            focal_length_x_mm=1.0,
+        )
 
-        """
-        clip.filepath # '//P1000213.MOV'
-        img = bpy.data.images.load(clip.filepath)
-        clip.frame_offset
-        clip.frame_start
-        """
+        output_collection = config.output_collection
+        if output_collection is None:
+            output_collection = context.scene.collection
+        
+        # Grab any existing marker IDs in the output collection.
+        # We have to access the collections through bpy.data, not context.
+        #for collection in bpy.data.collections:
+        marker_id_to_empty = dict()
+        for obj in output_collection.all_objects:
+            if obj.name.startswith(MARKER_PREFIX):
+                # TODO: A blender object might be renamed in a way that's incompatible. Check int parsing.
+                # https://docs.blender.org/api/current/info_gotchas_internal_data_and_python_objects.html
+                marker_id = int(obj.name.strip(MARKER_PREFIX))
+                marker_id_to_empty[marker_id] = obj
 
-        #__import__('code').interact(local=dict(globals(), **locals()))
+        total_time = 0.0
+        for frame_idx, pixels in enumerate(iterate_video_frames(context, bpy.data, clip)):
+            self.report({'INFO'}, f"Processing frame {frame_idx}... ")
+            start_time = time.time()
+            numpy.save(f"/home/joseph/tmp/debug_frame_{frame_idx}", pixels)
+            markers = fm.detect_markers(pixels)
+            print(f"Found {len(markers)} in frame {frame_idx}")
+            for marker in markers:
+                print(f"Marker {marker.marker_id} at {marker.position}")
+                # Some fiddling needed to go between the numpy vector types and the Blender types.
+                # See https://docs.blender.org/api/current/mathutils.html
+                
+                # As a reminder, the marker describes how to go from the model coordinate system to camera coordinate system.
+                
+                # This is a bit of a hack to get our rotation matrix into a quaternion.
+                translation = numpy.array(marker.position).reshape((3, 1))
+                rotation = marker.rotation_matrix
+                skew = numpy.array([0, 0, 0, 1])
+                # >>> tx = numpy.array([1, 2, 3]).reshape((3,1))
+                # >>> rx = numpy.eye(3)
+                # >>> skew = numpy.array([0, 0, 0, 1])
+                # >>> mathutils.Matrix(numpy.vstack([numpy.hstack([rx, tx]), skew])).decompose()
+                # (Vector((1.0, 2.0, 3.0)), Quaternion((1.0, 0.0, 0.0, 0.0)), Vector((1.0, 1.0, 1.0)))
+                translation, rotation, _scale = mathutils.Matrix(numpy.vstack([numpy.hstack([rotation, translation]), skew])).decompose()
 
-        # Spawn an oriented empty at a specific location
-        # For simplicity, we'll just spawn it at the origin
-        #bpy.ops.object.empty_add(type='PLAIN_AXES', location=(0, 0, 0))
-        #empty = context.object
-        #empty.name = f"Empty_Frame_{current_frame}"
-        #self.report({'INFO'}, f"Created Empty: {empty.name}")
+                # Now, find the marker in the collection if it exists and make a keyframe for it in the current position.
+                empty = marker_id_to_empty.get(marker.marker_id, None)
+                if empty is None:
+                    # Create a new marker and, for the previous frame, set it as not being detected.
+                    # We have to have a custom field on the empties so they know when they're detected and can be used to weight animations.
+                    bpy.ops.object.empty_add(type='ARROWS') # align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
+                    empty = context.object
+                    empty.name = MARKER_PREFIX + str(marker.marker_id)
+                    marker_id_to_empty[marker.marker_id] = empty
+                    #output_collection.objects.link(empty)  # This seems like it happens automatically?
+                    self.report({'INFO'}, f"Created Empty: {empty.name}")
+                
+                # https://docs.blender.org/api/current/info_quickstart.html#animation
+                # There's also a hilariously hacky way to add absolute position:
+                #bpy.ops.object.location_clear(clear_delta=False)
+                #bpy.ops.object.rotation_clear(clear_delta=False)
+                #bpy.ops.transform.translate(value=(0.344667, 2.27031, 1.20884), orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'INCREMENT'}, use_snap_project=False, snap_target='CLOSEST', use_snap_self=True, use_snap_edit=True, use_snap_nonedit=True, use_snap_selectable=False)
+                empty.location = translation
+                empty.keyframe_insert(data_path="location", frame=float(frame_idx))  # index=2 would set only z, for example.
+                empty.rotation_quaternion = rotation
+                empty.keyframe_insert(data_path="rotation_quaternion", frame=float(frame_idx))
+            end_time = time.time()
+            delta_time = end_time - start_time
+            total_time += delta_time
+            self.report({'INFO'}, f" ... Done processeing frame {frame_idx} in {delta_time} seconds. Found/updated {len(markers)} markers.")
+            # TODO: Reverse the camera one.
 
         return {'FINISHED'}
 
