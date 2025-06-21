@@ -122,7 +122,7 @@ def get_active_movie_clip(context: bpy.types.Context):
         return bpy.data.movieclips[0]
     return None
 
-def iterate_video_frames(
+def iterate_video_frames_blender(
         context: bpy.types.Context,
         data: bpy.types.BlendData,
         movie_clip: bpy.types.MovieClip | str | None = None, 
@@ -191,25 +191,31 @@ def iterate_video_frames(
     # TypeError: bpy_struct: item.attr = val: SpaceImageEditor.image expected a Image type, not MovieClip
     #>>> context.screen.areas[2].spaces[0].image.pixels[0]
     image = data.images.load(movie_clip.filepath)
-    viewer_space.image = image
     image_width = image.size[0]
     image_height = image.size[1]
-    channels = 4  # image space is always exported as 4 bytes?
+    viewer_space.image = image
+    previous_frame = None
+
     for frame_idx in range(start_frame, end_frame):
-        viewer_space.image_user.frame_offset = frame_idx
+        viewer_space.image_user.frame_offset = frame_idx  # This works for older versions.
+        #context.scene.frame_current = frame_idx
         
         # Force refresh
         viewer_space.display_channels = 'COLOR_ALPHA'
         viewer_space.display_channels = 'COLOR'
 
-        image_data = numpy.array(viewer_space.image.pixels).reshape((image_height, image_width, channels))
-        # Because we can't have nice things, the image is also inverted.
-        image_data = image_data[::-1,:,:]
+        image_data = numpy.array(viewer_space.image.pixels).reshape((image_height, image_width, len(viewer_space.image.pixels)//(image_height*image_width)))
+        image_data = image_data[::-1,:,:] # Because we can't have nice things, the image is also flipped.
+        if previous_frame is not None and numpy.allclose(image_data, previous_frame, rtol=1e-8, atol=1e-8):
+            print("Skipping duplicate frame.")
+            continue
         yield(image_data)
 
         #pixels = list(viewer_space.image.pixels)
         #tmp = bpy.data.images.new(name="sample"+str(frame), width=w, height=h, alpha=False, float_buffer=False)
         #tmp.pixels = pixels
+        
+        previous_frame = image_data
     image.user_clear()
     data.images.remove(image)
 
@@ -311,7 +317,7 @@ class BFM_OT_Track(bpy.types.Operator):
                 marker_id_to_empty[marker_id] = obj
 
         total_time = 0.0
-        for frame_idx, pixels in enumerate(iterate_video_frames(context, bpy.data, clip)):
+        for frame_idx, pixels in enumerate(iterate_video_frames_blender(context, bpy.data, clip)):
             self.report({'INFO'}, f"Processing frame {frame_idx}... ")
             start_time = time.time()
             numpy.save(f"/home/joseph/tmp/debug_frame_{frame_idx}", pixels)
