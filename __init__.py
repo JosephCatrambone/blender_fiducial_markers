@@ -19,12 +19,12 @@ import subprocess
 import time
 
 #from .bfm import FiducialMarkerDetector
-from .bfm_native import FiducialMarkerDetectorNative as Detector
-try:
-    from .bfm_native import FiducialMarkerDetectorNative as Detector
-except ImportError as e:
-    print(f"Could not import native fiducial marker library - probably missing OpenCV - falling back to pure Python.  Exception: {e}")
-    from .bfm_python import FiducialMarkerDetectorPython as Detector
+from .bfm_external import FiducialMarkerDetectorExternal as Detector
+#try:
+#    from .bfm_native import FiducialMarkerDetectorNative as Detector
+#except ImportError as e:
+#    print(f"Could not import native fiducial marker library - probably missing OpenCV - falling back to pure Python.  Exception: {e}")
+#    from .bfm_python import FiducialMarkerDetectorPython as Detector
 
 MARKER_PREFIX = "BFM_MARKER_"
 

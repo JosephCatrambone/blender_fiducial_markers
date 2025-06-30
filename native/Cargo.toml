@@ -1,0 +1,11 @@
+[package]
+name = "fiducial_track_video"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ffmpeg-the-third = { version = "3.0.2", features = ["codec", "format"] } # +ffmpeg-7.1
+aruco3 = { git = "https://github.com/JosephCatrambone/aruco3.git" }
+clap = { version = "4.5.40", features = ["derive"] }
+image = "0.25.6"
+#serde_json = "1.0.140"
