@@ -13,18 +13,12 @@ bl_info = {
 
 import bpy
 import importlib
+import json
 import mathutils
 import numpy
+import os
 import subprocess
 import time
-
-#from .bfm import FiducialMarkerDetector
-from .bfm_external import FiducialMarkerDetectorExternal as Detector
-#try:
-#    from .bfm_native import FiducialMarkerDetectorNative as Detector
-#except ImportError as e:
-#    print(f"Could not import native fiducial marker library - probably missing OpenCV - falling back to pure Python.  Exception: {e}")
-#    from .bfm_python import FiducialMarkerDetectorPython as Detector
 
 MARKER_PREFIX = "BFM_MARKER_"
 
@@ -41,6 +35,80 @@ MARKER_PREFIX = "BFM_MARKER_"
 
 # We have to register all of these individually, I guess?
 
+# Detection/CV Side:
+
+from dataclasses import dataclass
+
+@dataclass
+class FiducialMarkerDetectorConfiguration:
+    marker_size_mm: float
+    maximum_bit_errors: float
+    downsample: int | None = None  # If nonzero, will use only one out of every 'downsample' pixels.
+    contour_simplification_epsilon: float = 0.05
+    threshold_window: int = 7  # How big should the nonmaximal suppression window be?
+    minimum_side_length_factor: float = 0.05
+
+@dataclass
+class MarkerPose:
+    position: mathutils.Vector
+    rotation: mathutils.Quaternion
+    error: float
+
+@dataclass
+class MarkerDetection:
+    frame_idx: int
+    marker_id: int  # Can be thought of as the 'index' of the marker.
+    corners: list[tuple[int, int]]  # Left, Top, Right, Bottom
+    poses: list[MarkerPose]
+
+    @classmethod
+    def from_json_string(cls, line: str) -> tuple[int, list]:
+        data = json.loads(line)
+        frame_idx = data.pop("frame_id")
+        detections = data.pop("detections")
+        markers = list()
+        for d in detections:
+            marker_id = d["marker_id"]
+            corners = [(int(x), int(y)) for x,y in zip(d["corners"][0::2], d["corners"][1::2], )]
+            poses = list()
+            for p in d["poses"]:
+                poses.append(
+                    MarkerPose(
+                        position=mathutils.Vector(p["translation"]),
+                        rotation=mathutils.Matrix([
+                            p["rotation"][0:3] + [0.0,], 
+                            p["rotation"][3:6] + [0.0,], 
+                            p["rotation"][6:9] + [0.0,],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ]).decompose()[1],
+                        error=p["error"]
+                    )
+                )
+            markers.append(cls(frame_idx=frame_idx, marker_id=marker_id, corners=corners, poses=poses))
+        return frame_idx, markers
+
+AR_DICTIONARIES = [
+    "ARTAG",
+    "ARUCO_MIP_36H12",
+    "ARUCO_MIP_16H3",
+    "APRILTAG_25H7",
+    "APRILTAG_36H11",
+    "APRILTAG_25H9",
+    "CHILITAGS",
+    "ARTOOLKITPLUS",
+    "APRILTAG_36H10",
+    "ARUCO_DEFAULT",
+    "ARUCO",
+    "ARTOOLKITPLUSBCH",
+    "ARUCO_MIP_25H7",
+    "APRILTAG_36H9",
+    "APRILTAG_16H5",
+]
+
+EXECUTABLE_NAME = "fiducial_track_video"
+
+# UI Configuration (Blender-side):
+
 class BFM_PGT_TrackingConfiguration(bpy.types.PropertyGroup):
     # I tried adding these into the operator, which seemed like the most intuitive way to keep them, as a 'run' is generally a one-time operation.
     # I'm moving this to a collection property to add it to the scene.
@@ -49,7 +117,11 @@ class BFM_PGT_TrackingConfiguration(bpy.types.PropertyGroup):
     origin_marker: bpy.props.IntProperty(name="Origin Marker ID", default=0)  # type: ignore
     generate_2d_tracks: bpy.props.BoolProperty(name="Generate 2D Tracking Markers", default=False, description="Generate 2D tracks in addition to the 3D empties.")  # type: ignore
     empties_at_center: bpy.props.BoolProperty(name="Empties at Center", default=True, description="If true, generates empties at the center of the detected markers, else generates them at the top-left corner.")  # type: ignore
-    dictionary: bpy.props.StringProperty(name="Fiducial Dictionary", default="ARUCO_DEFAULT")  # type: ignore
+    dictionary: bpy.props.EnumProperty(
+        name="Fiducial Dictionary", 
+        default="ARUCO", 
+        items=[(d, d, "") for d in AR_DICTIONARIES]
+    )  # type: ignore
 
     @classmethod
     def register(cls):
@@ -96,15 +168,6 @@ class BFM_PT_TrackingPanel(bpy.types.Panel):
 
 # Functions:
 
-def get_viewer_area_and_space(context: bpy.types.Context, area_of_type: str, space_of_type: str):
-    # Returns area and space matching the 'of_type', like 'IMAGE_EDITOR'
-    for viewer_area in context.screen.areas:
-        if viewer_area.type == area_of_type:
-            for space in viewer_area.spaces:
-                if space.type == space_of_type:
-                    return viewer_area, space
-    return None, None
-
 def get_active_movie_clip(context: bpy.types.Context):
     """
     If the current context is a CLIP_EDITOR, pull the movie clip from that.
@@ -121,115 +184,6 @@ def get_active_movie_clip(context: bpy.types.Context):
     elif len(bpy.data.movieclips) == 1:
         return bpy.data.movieclips[0]
     return None
-
-def iterate_video_frames_blender(
-        context: bpy.types.Context,
-        data: bpy.types.BlendData,
-        movie_clip: bpy.types.MovieClip | str | None = None, 
-        start_frame: int | None = None, 
-        end_frame: int | None = None,
-    ):
-    """
-    Returns an iterator that yields arrays of pixel data for each frame of the specified movie clip.
-    This will temporarily transform one of the viewing areas into an IMAGE_EDITOR type between yields.
-    @param movie_clip is either the movie clip to load or the name of the clip. If 'None', will use the one from the current scene context.
-    @param start_frame is the point that generation should begin. If None, will use the timeline first frame.
-    @param end_frame is the last frame (exclusive) that should be yielded.  If None, will use the timeline.
-    """
-    # Populate all fields 'smartly'.
-    if start_frame is None:
-        start_frame = context.scene.frame_start
-    start_frame = int(start_frame)  # type: ignore
-    if end_frame is None:
-        end_frame = context.scene.frame_end
-    end_frame = int(end_frame)  # type: ignore
-
-    if movie_clip is None:
-        # First, try to pull from the tracking context.
-        movie_clip = get_active_movie_clip(context)
-    elif isinstance(movie_clip, str):
-        # See if we can get a movie clip from the loaded data.
-        movie_clip = data.movieclips(movie_clip)
-    if movie_clip is None:
-        raise Exception("The active movie clip could not be determined or loaded. It is possible the context is missing or the name is incorrect.")
-
-    # TODO: We need to make a temporary area on this screen with an image editor.
-    # bpy.data.screens[current] points to context.screen.areas
-    
-    # This is taken from and modified from a stackoverflow post by Kivig.
-    original_area_type = None
-    original_space_type = None
-    viewer_area = None
-    viewer_space = None
-    for candidate_area in context.screen.areas:
-        if candidate_area.type == 'IMAGE_EDITOR':
-            viewer_area = candidate_area
-            break
-    if viewer_area is None:
-        original_area_type = context.screen.areas[0].type
-        context.screen.areas[0].type = 'IMAGE_EDITOR'
-        viewer_area = context.screen.areas[0]
-        original_space_type = viewer_area.spaces[0].type
-        # viewer_area.spaces[0].type = 'IMAGE_EDITOR'  # This is read-only?  Is the type implicit on making it an image editor?
-        viewer_space = viewer_area.spaces[0]
-    else:
-        for candidate_space in viewer_area.spaces:
-            if candidate_space.type == 'IMAGE_EDITOR':
-                viewer_space = candidate_space
-                break
-    if viewer_space is None:
-        original_space_type = viewer_area.spaces[0].type
-        viewer_space = viewer_area.spaces[0]
-        viewer_space.type = 'IMAGE_EDITOR'
-        
-    
-    # Load image sequence or movie clip.
-    # Can't do the easy thing and just assign + read.
-    # >>> context.screen.areas[2].spaces[0].image = bpy.data.movieclips['P1000213.MOV']
-    # Traceback (most recent call last):
-    #  File "<blender_console>", line 1, in <module>
-    # TypeError: bpy_struct: item.attr = val: SpaceImageEditor.image expected a Image type, not MovieClip
-    #>>> context.screen.areas[2].spaces[0].image.pixels[0]
-    image = data.images.load(movie_clip.filepath)
-    image_width = image.size[0]
-    image_height = image.size[1]
-    viewer_space.image = image
-    previous_frame = None
-
-    for frame_idx in range(start_frame, end_frame):
-        viewer_space.image_user.frame_offset = frame_idx  # This works for older versions.
-        #context.scene.frame_current = frame_idx
-        
-        # Force refresh
-        viewer_space.display_channels = 'COLOR_ALPHA'
-        viewer_space.display_channels = 'COLOR'
-
-        image_data = numpy.array(viewer_space.image.pixels).reshape((image_height, image_width, len(viewer_space.image.pixels)//(image_height*image_width)))
-        image_data = image_data[::-1,:,:] # Because we can't have nice things, the image is also flipped.
-        if previous_frame is not None and numpy.allclose(image_data, previous_frame, rtol=1e-8, atol=1e-8):
-            print("Skipping duplicate frame.")
-            continue
-        yield(image_data)
-
-        #pixels = list(viewer_space.image.pixels)
-        #tmp = bpy.data.images.new(name="sample"+str(frame), width=w, height=h, alpha=False, float_buffer=False)
-        #tmp.pixels = pixels
-        
-        previous_frame = image_data
-    image.user_clear()
-    data.images.remove(image)
-
-    # Restore the starting state.
-    if original_space_type is not None:
-        try:
-            viewer_space.type = original_space_type
-        except Exception:
-            pass
-    if original_area_type is not None:
-        try:
-            viewer_area.type = original_area_type
-        except Exception:
-            pass
 
 class BFM_OT_DebugUnregister(bpy.types.Operator):
     bl_idname = "bfm.debug_reset"
@@ -259,6 +213,8 @@ class BFM_OT_Track(bpy.types.Operator):
         return True
 
     def execute(self, context):
+        executable_path = os.path.join(os.path.dirname(__file__), EXECUTABLE_NAME)
+        
         # Ensure we are in the Tracking context
         space = context.space_data
         if space.type != 'CLIP_EDITOR':
@@ -270,6 +226,11 @@ class BFM_OT_Track(bpy.types.Operator):
         if not clip:
             self.report({'ERROR'}, "No active clip found!")
             return {'CANCELLED'}
+        
+        if clip.library:
+            clip_path = bpy.path.abspath(clip.filepath, library=clip.library)
+        else:
+            clip_path = bpy.path.abspath(clip.filepath)
         
         config: BFM_PGT_TrackingConfiguration = context.scene.bfm_settings
 
@@ -283,6 +244,8 @@ class BFM_OT_Track(bpy.types.Operator):
         #    )
         #)
 
+        # Select a camera or get the default one.
+
         #bpy.data.movieclips['Something.mov'].name
         #bpy.data.scenes['Scene'].frame_current
         #bpy.data.scenes['Scene'].frame_start
@@ -292,14 +255,6 @@ class BFM_OT_Track(bpy.types.Operator):
         #current_frame = clip.frame_current
         #current_frame = bpy.data.scenes['Scene'].frame_current
         #current_frame = context.scene.frame_current
-
-        
-        fm = Detector(
-            marker_size_mm=config.marker_size_mm, 
-            downsample_to=(1920, 1080), 
-            dictionary=config.dictionary, 
-            focal_length_x_mm=1.0,
-        )
 
         output_collection = config.output_collection
         if output_collection is None:
@@ -316,32 +271,29 @@ class BFM_OT_Track(bpy.types.Operator):
                 marker_id = int(obj.name.strip(MARKER_PREFIX))
                 marker_id_to_empty[marker_id] = obj
 
+        args=[executable_path, clip_path, config.dictionary, str(config.marker_size_mm)]
+
+        # On Windows we need to set process flags to ensure that we run async.  Also, if shell=True then we need to pass a string of args rather than a list.
+        # Also, if shell=True then we need to do " ".join(args)
+        proc = subprocess.Popen(
+            args=args,
+            stdin=None,
+            stdout=subprocess.PIPE,
+            text=True,
+            shell=False,
+        )
+
         total_time = 0.0
-        for frame_idx, pixels in enumerate(iterate_video_frames_blender(context, bpy.data, clip)):
+        for line in proc.stdout:
+            print(line)
+
+            frame_idx, detections = MarkerDetection.from_json_string(line)
             self.report({'INFO'}, f"Processing frame {frame_idx}... ")
             start_time = time.time()
-            numpy.save(f"/home/joseph/tmp/debug_frame_{frame_idx}", pixels)
-            markers = fm.detect_markers(pixels)
-            print(f"Found {len(markers)} in frame {frame_idx}")
-            for marker in markers:
-                print(f"Marker {marker.marker_id} at {marker.position}")
-                # Some fiddling needed to go between the numpy vector types and the Blender types.
-                # See https://docs.blender.org/api/current/mathutils.html
-                
-                # As a reminder, the marker describes how to go from the model coordinate system to camera coordinate system.
-                
-                # This is a bit of a hack to get our rotation matrix into a quaternion.
-                translation = numpy.array(marker.position).reshape((3, 1))
-                rotation = marker.rotation_matrix
-                skew = numpy.array([0, 0, 0, 1])
-                # >>> tx = numpy.array([1, 2, 3]).reshape((3,1))
-                # >>> rx = numpy.eye(3)
-                # >>> skew = numpy.array([0, 0, 0, 1])
-                # >>> mathutils.Matrix(numpy.vstack([numpy.hstack([rx, tx]), skew])).decompose()
-                # (Vector((1.0, 2.0, 3.0)), Quaternion((1.0, 0.0, 0.0, 0.0)), Vector((1.0, 1.0, 1.0)))
-                translation, rotation, _scale = mathutils.Matrix(numpy.vstack([numpy.hstack([rotation, translation]), skew])).decompose()
-
-                # Now, find the marker in the collection if it exists and make a keyframe for it in the current position.
+            print(f"Found {len(detections)} in frame {frame_idx}")
+            for marker in detections:
+                print(f"Marker {marker.marker_id} at {marker.poses[0].position}")
+                # Find the marker in the collection if it exists and make a keyframe for it in the current position.
                 empty = marker_id_to_empty.get(marker.marker_id, None)
                 if empty is None:
                     # Create a new marker and, for the previous frame, set it as not being detected.
@@ -358,14 +310,14 @@ class BFM_OT_Track(bpy.types.Operator):
                 #bpy.ops.object.location_clear(clear_delta=False)
                 #bpy.ops.object.rotation_clear(clear_delta=False)
                 #bpy.ops.transform.translate(value=(0.344667, 2.27031, 1.20884), orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'INCREMENT'}, use_snap_project=False, snap_target='CLOSEST', use_snap_self=True, use_snap_edit=True, use_snap_nonedit=True, use_snap_selectable=False)
-                empty.location = translation
+                empty.location = marker.poses[0].position
                 empty.keyframe_insert(data_path="location", frame=float(frame_idx))  # index=2 would set only z, for example.
-                empty.rotation_quaternion = rotation
+                empty.rotation_quaternion = marker.poses[0].rotation
                 empty.keyframe_insert(data_path="rotation_quaternion", frame=float(frame_idx))
             end_time = time.time()
             delta_time = end_time - start_time
             total_time += delta_time
-            self.report({'INFO'}, f" ... Done processeing frame {frame_idx} in {delta_time} seconds. Found/updated {len(markers)} markers.")
+            self.report({'INFO'}, f" ... Done processeing frame {frame_idx} in {delta_time} seconds. Found/updated {len(detections)} markers.")
             # TODO: Reverse the camera one.
 
         return {'FINISHED'}
