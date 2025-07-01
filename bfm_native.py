@@ -3,8 +3,9 @@
 
 import cv2
 import numpy
+import os
 #from mathutils import Matrix, Vector
-from .bfm import FiducialMarkerDetector, MarkerDetection
+from .bfm_marker import MarkerDetection
 
 ARUCO_NAME_TO_DICT = {
 	"ARUCO_DEFAULT": cv2.aruco.DICT_ARUCO_ORIGINAL,
@@ -12,20 +13,18 @@ ARUCO_NAME_TO_DICT = {
 	"APRILTAG_36H11": cv2.aruco.DICT_APRILTAG_36H11
 }
 
-class FiducialMarkerDetectorNative(FiducialMarkerDetector):
-	def __init__(self, *args, **kwargs):
-		super().__init__(*args, **kwargs)
-		self.dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_NAME_TO_DICT[self.dictionary_name])
+class FiducialMarkerDetectorNative:
+	def __init__(self, dictionary_name: str, marker_size_mm: float, focal_length_mm: float):
+		self.dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_NAME_TO_DICT[dictionary_name])
 		config = cv2.aruco.DetectorParameters()
 		self.detector: cv2.aruco.ArucoDetector = cv2.aruco.ArucoDetector(self.dictionary, config)
-
-		self.distortion_coefficients = kwargs.get("distortion_coefficients", None)
-		self.camera_intrinsics = kwargs.get("camera_intrinsics", None)
+		self.focal_length_mm = focal_length_mm
+		self.marker_size_mm = marker_size_mm
 	
 	#@overrides
-	def detect_markers(self, image: numpy.ndarray) -> list[MarkerDetection]:
+	def detect_markers(self, filepath: str) -> list[tuple[int, list[MarkerDetection]]]:
 		# return super().detect_markers(image_array)
-		image = (image * 255).astype(numpy.uint8)
+		video = cv2.VideoCapture(filepath)
 		
 		hw = self.marker_size_mm/2.0
 		marker_points = numpy.float32([
@@ -35,15 +34,11 @@ class FiducialMarkerDetectorNative(FiducialMarkerDetector):
 			[-hw, -hw, 0.0],
 		])
 
-		intrinsics = None
-		if self.camera_intrinsics is not None:
-			intrinsics = self.camera_intrinsics
-		else:
-			intrinsics = numpy.float32([
-				[1.0, 0.0, image.shape[1]/2.0],
-				[0.0, 1.0, image.shape[0]/2.0],
-				[0.0, 0.0, 1.0],
-			])
+		intrinsics = numpy.float32([
+			[1.0, 0.0, image.shape[1]/2.0],
+			[0.0, 1.0, image.shape[0]/2.0],
+			[0.0, 0.0, 1.0],
+		])
 		
 		corners, ids, rejected = self.detector.detectMarkers(image)
 		#detected_markers = aruco_display(corners, ids, rejected, image)

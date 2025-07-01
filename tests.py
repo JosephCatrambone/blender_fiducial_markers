@@ -1,0 +1,1 @@
+# These are tests for bfm_fiducial, NOT the blender interface in __init__.

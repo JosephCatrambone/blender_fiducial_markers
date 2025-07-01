@@ -48,45 +48,6 @@ class FiducialMarkerDetectorConfiguration:
     threshold_window: int = 7  # How big should the nonmaximal suppression window be?
     minimum_side_length_factor: float = 0.05
 
-@dataclass
-class MarkerPose:
-    position: mathutils.Vector
-    rotation: mathutils.Quaternion
-    error: float
-
-@dataclass
-class MarkerDetection:
-    frame_idx: int
-    marker_id: int  # Can be thought of as the 'index' of the marker.
-    corners: list[tuple[int, int]]  # Left, Top, Right, Bottom
-    poses: list[MarkerPose]
-
-    @classmethod
-    def from_json_string(cls, line: str) -> tuple[int, list]:
-        data = json.loads(line)
-        frame_idx = data.pop("frame_id")
-        detections = data.pop("detections")
-        markers = list()
-        for d in detections:
-            marker_id = d["marker_id"]
-            corners = [(int(x), int(y)) for x,y in zip(d["corners"][0::2], d["corners"][1::2], )]
-            poses = list()
-            for p in d["poses"]:
-                poses.append(
-                    MarkerPose(
-                        position=mathutils.Vector(p["translation"]),
-                        rotation=mathutils.Matrix([
-                            p["rotation"][0:3] + [0.0,], 
-                            p["rotation"][3:6] + [0.0,], 
-                            p["rotation"][6:9] + [0.0,],
-                            [0.0, 0.0, 0.0, 1.0],
-                        ]).decompose()[1],
-                        error=p["error"]
-                    )
-                )
-            markers.append(cls(frame_idx=frame_idx, marker_id=marker_id, corners=corners, poses=poses))
-        return frame_idx, markers
-
 AR_DICTIONARIES = [
     "ARTAG",
     "ARUCO_MIP_36H12",
@@ -104,8 +65,6 @@ AR_DICTIONARIES = [
     "APRILTAG_36H9",
     "APRILTAG_16H5",
 ]
-
-EXECUTABLE_NAME = "fiducial_track_video"
 
 # UI Configuration (Blender-side):
 
@@ -213,8 +172,6 @@ class BFM_OT_Track(bpy.types.Operator):
         return True
 
     def execute(self, context):
-        executable_path = os.path.join(os.path.dirname(__file__), EXECUTABLE_NAME)
-        
         # Ensure we are in the Tracking context
         space = context.space_data
         if space.type != 'CLIP_EDITOR':
@@ -271,17 +228,7 @@ class BFM_OT_Track(bpy.types.Operator):
                 marker_id = int(obj.name.strip(MARKER_PREFIX))
                 marker_id_to_empty[marker_id] = obj
 
-        args=[executable_path, clip_path, config.dictionary, str(config.marker_size_mm)]
-
-        # On Windows we need to set process flags to ensure that we run async.  Also, if shell=True then we need to pass a string of args rather than a list.
-        # Also, if shell=True then we need to do " ".join(args)
-        proc = subprocess.Popen(
-            args=args,
-            stdin=None,
-            stdout=subprocess.PIPE,
-            text=True,
-            shell=False,
-        )
+        
 
         total_time = 0.0
         for line in proc.stdout:
@@ -314,6 +261,8 @@ class BFM_OT_Track(bpy.types.Operator):
                 empty.keyframe_insert(data_path="location", frame=float(frame_idx))  # index=2 would set only z, for example.
                 empty.rotation_quaternion = marker.poses[0].rotation
                 empty.keyframe_insert(data_path="rotation_quaternion", frame=float(frame_idx))
+                if config.origin_marker > 0 and marker.marker_id == config.origin_marker:
+                    pass
             end_time = time.time()
             delta_time = end_time - start_time
             total_time += delta_time
