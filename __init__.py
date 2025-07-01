@@ -20,6 +20,9 @@ import os
 import subprocess
 import time
 
+from .bfm_external import FiducialMarkerDetectorExternal
+from .bfm_native import FiducialMarkerDetectorNative
+
 MARKER_PREFIX = "BFM_MARKER_"
 
 # Debug breakpoint in Blender:
@@ -36,17 +39,6 @@ MARKER_PREFIX = "BFM_MARKER_"
 # We have to register all of these individually, I guess?
 
 # Detection/CV Side:
-
-from dataclasses import dataclass
-
-@dataclass
-class FiducialMarkerDetectorConfiguration:
-    marker_size_mm: float
-    maximum_bit_errors: float
-    downsample: int | None = None  # If nonzero, will use only one out of every 'downsample' pixels.
-    contour_simplification_epsilon: float = 0.05
-    threshold_window: int = 7  # How big should the nonmaximal suppression window be?
-    minimum_side_length_factor: float = 0.05
 
 AR_DICTIONARIES = [
     "ARTAG",
@@ -228,13 +220,11 @@ class BFM_OT_Track(bpy.types.Operator):
                 marker_id = int(obj.name.strip(MARKER_PREFIX))
                 marker_id_to_empty[marker_id] = obj
 
+        bfm_system = FiducialMarkerDetectorNative(config.dictionary, config.marker_size_mm, 1.0)
         
-
         total_time = 0.0
-        for line in proc.stdout:
-            print(line)
-
-            frame_idx, detections = MarkerDetection.from_json_string(line)
+        self.report({'INFO'}, f"Reading from movie clip at {clip_path}")
+        for frame_idx, detections in bfm_system.detect_markers(clip_path):
             self.report({'INFO'}, f"Processing frame {frame_idx}... ")
             start_time = time.time()
             print(f"Found {len(detections)} in frame {frame_idx}")
@@ -259,7 +249,7 @@ class BFM_OT_Track(bpy.types.Operator):
                 #bpy.ops.transform.translate(value=(0.344667, 2.27031, 1.20884), orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'INCREMENT'}, use_snap_project=False, snap_target='CLOSEST', use_snap_self=True, use_snap_edit=True, use_snap_nonedit=True, use_snap_selectable=False)
                 empty.location = marker.poses[0].position
                 empty.keyframe_insert(data_path="location", frame=float(frame_idx))  # index=2 would set only z, for example.
-                empty.rotation_quaternion = marker.poses[0].rotation
+                empty.rotation_quaternion = mat3_to_quaternion(marker.poses[0].rotation)
                 empty.keyframe_insert(data_path="rotation_quaternion", frame=float(frame_idx))
                 if config.origin_marker > 0 and marker.marker_id == config.origin_marker:
                     pass
@@ -269,7 +259,21 @@ class BFM_OT_Track(bpy.types.Operator):
             self.report({'INFO'}, f" ... Done processeing frame {frame_idx} in {delta_time} seconds. Found/updated {len(detections)} markers.")
             # TODO: Reverse the camera one.
 
+        self.report({'INFO'}, "Finished reading fiducials.")
         return {'FINISHED'}
+
+# Helpers:
+
+def mat3_to_quaternion(mat: list[float]) -> mathutils.Quaternion:
+    blender_mat = mathutils.Matrix([
+        mat[0:3] + [0.0,], 
+        mat[3:6] + [0.0,],
+        mat[6:9] + [0.0,],
+        [0.0, 0.0, 0.0, 1.0]
+    ])
+    _tx, q, _scale = blender_mat.decompose()
+    return q
+
 
 # Blender Addon Registration and Boilerplate:
 
@@ -303,7 +307,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
 
 """
 import sys
