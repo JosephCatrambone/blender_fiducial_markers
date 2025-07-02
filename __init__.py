@@ -65,7 +65,7 @@ class BFM_PGT_TrackingConfiguration(bpy.types.PropertyGroup):
 	# I'm moving this to a collection property to add it to the scene.
 	output_collection: bpy.props.PointerProperty(type=bpy.types.Collection, name="Collection") # type: ignore
 	marker_size_mm: bpy.props.FloatProperty(name="Marker Size (mm)", description="The side-length of a marker in millimeters.")  # type: ignore
-	origin_marker: bpy.props.IntProperty(name="Origin Marker ID", default=0)  # type: ignore
+	origin_marker: bpy.props.IntProperty(name="Origin Marker ID", default=-1)  # type: ignore
 	generate_2d_tracks: bpy.props.BoolProperty(name="Generate 2D Tracking Markers", default=False, description="Generate 2D tracks in addition to the 3D empties.")  # type: ignore
 	empties_at_center: bpy.props.BoolProperty(name="Empties at Center", default=True, description="If true, generates empties at the center of the detected markers, else generates them at the top-left corner.")  # type: ignore
 	dictionary: bpy.props.EnumProperty(
@@ -73,6 +73,10 @@ class BFM_PGT_TrackingConfiguration(bpy.types.PropertyGroup):
 		default="ARUCO", 
 		items=[(d, d, "") for d in AR_DICTIONARIES]
 	)  # type: ignore
+	camera_to_bake: bpy.props.PointerProperty(type=bpy.types.Camera, name="Camera to Bake", description="The camera to which relative motion will be baked if an origin marker is set.")  # type: ignore
+	
+	# TODO: Give users the option to bake the points relative to the camera's transform if camera_to_bake is None? If unset, assume camera at origin like now?
+	# TODO: Also give people the option to specify MULTIPLE different static fiducial markers and average them for camera position?
 
 	@classmethod
 	def register(cls):
@@ -102,6 +106,7 @@ class BFM_PT_TrackingPanel(bpy.types.Panel):
 
 		col = layout.column(heading="Output", align=True)
 		col.prop(context.scene.bfm_settings, "output_collection")  # Empty text because the parent section already has 'Output Collection'
+		col.prop(context.scene.bfm_settings, "camera_to_bake")
 
 		col = layout.column(heading="Space Configuration", align=True)
 		col.prop(context.scene.bfm_settings, "marker_size_mm", text="Marker Size (mm)")
@@ -109,8 +114,8 @@ class BFM_PT_TrackingPanel(bpy.types.Panel):
 
 		col = layout.column(heading="Markers", align=True)
 		col.prop(context.scene.bfm_settings, "dictionary", text="Dictionary")  # TODO: Make this an enum
-		col.prop(context.scene.bfm_settings, "generate_2d_tracks", text="Generate 2D Tracks")
-		col.prop(context.scene.bfm_settings, "empties_at_center", text="Empties at Center")
+		#col.prop(context.scene.bfm_settings, "generate_2d_tracks", text="Generate 2D Tracks")
+		#col.prop(context.scene.bfm_settings, "empties_at_center", text="Empties at Center")
 
 		_op = layout.operator("bfm.track", text="Run Tracking")
 
@@ -181,24 +186,20 @@ class BFM_OT_Track(bpy.types.Operator):
 		else:
 			clip_path = bpy.path.abspath(clip.filepath)
 		
+		# Needed for assigning tracking markers.
+		clip_width = clip.size[0]
+		clip_height = clip.size[1]
+
 		config: BFM_PGT_TrackingConfiguration = context.scene.bfm_settings
 
 		if config.marker_size_mm <= 0.0:
 			self.report({'ERROR'}, "Marker size should be greater than zero.")
 			return {'CANCELLED'}
+		
+		if config.camera_to_bake is not None and config.origin_marker < 1:
+			self.report({'ERROR'}, "Camera bake is set but there is no origin marker. For a camera to be oriented the origin marker id must be set.")
+			return {'CANCELLED'}
 
-		#self.report(
-		#    {'INFO'}, "F: {:.2f}  B: {:s}  S: {!r}".format(
-		#        self.my_float, self.my_bool, self.my_string,
-		#    )
-		#)
-
-		# Select a camera or get the default one.
-
-		#bpy.data.movieclips['Something.mov'].name
-		#bpy.data.scenes['Scene'].frame_current
-		#bpy.data.scenes['Scene'].frame_start
-		#bpy.data.scenes['Scene'].frame_end
 		#bpy.data.movieclips['P1000213.MOV'].frame_start
 		#bpy.data.movieclips['P1000213.MOV'].frame_duration
 		#current_frame = clip.frame_current
@@ -209,6 +210,9 @@ class BFM_OT_Track(bpy.types.Operator):
 		if output_collection is None:
 			output_collection = context.scene.collection
 		
+		# TODO: when a marker goes from not-visible to visible we need to set the keyframe at the previous value OR change the interpolation type for the visible property to 'keep'.
+		all_marker_ids = set()
+
 		# Grab any existing marker IDs in the output collection.
 		# We have to access the collections through bpy.data, not context.
 		#for collection in bpy.data.collections:
@@ -220,16 +224,18 @@ class BFM_OT_Track(bpy.types.Operator):
 				marker_id = int(obj.name.strip(MARKER_PREFIX))
 				marker_id_to_empty[marker_id] = obj
 
+		# Also give the user the chance to capture video tracks.
+		marker_id_to_tracker = dict()
+
 		bfm_system = FiducialMarkerDetectorNative(config.dictionary, config.marker_size_mm, 1.0)
 		
 		total_time = 0.0
 		self.report({'INFO'}, f"Reading from movie clip at {clip_path}")
 		for frame_idx, detections in bfm_system.detect_markers(clip_path):
 			self.report({'INFO'}, f"Processing frame {frame_idx}... ")
-			start_time = time.time()
-			print(f"Found {len(detections)} in frame {frame_idx}")
+			context.scene.frame_set(frame_idx)  # Not strictly necessary for setting keyframes, but updates the UI.
+			visible_marker_ids = set()  # Visible in this frame.
 			for marker in detections:
-				print(f"Marker {marker.marker_id} at {marker.poses[0].position}")
 				# Find the marker in the collection if it exists and make a keyframe for it in the current position.
 				empty = marker_id_to_empty.get(marker.marker_id, None)
 				if empty is None:
@@ -238,26 +244,89 @@ class BFM_OT_Track(bpy.types.Operator):
 					bpy.ops.object.empty_add(type='ARROWS') # align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
 					empty = context.object
 					empty.name = MARKER_PREFIX + str(marker.marker_id)
+					empty.rotation_mode = 'QUATERNION'
 					marker_id_to_empty[marker.marker_id] = empty
 					#output_collection.objects.link(empty)  # This seems like it happens automatically?
 					self.report({'INFO'}, f"Created Empty: {empty.name}")
 				
 				# https://docs.blender.org/api/current/info_quickstart.html#animation
-				# There's also a hilariously hacky way to add absolute position:
-				#bpy.ops.object.location_clear(clear_delta=False)
-				#bpy.ops.object.rotation_clear(clear_delta=False)
-				#bpy.ops.transform.translate(value=(0.344667, 2.27031, 1.20884), orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'INCREMENT'}, use_snap_project=False, snap_target='CLOSEST', use_snap_self=True, use_snap_edit=True, use_snap_nonedit=True, use_snap_selectable=False)
-				empty.location = marker.poses[0].position
-				empty.keyframe_insert(data_path="location", frame=float(frame_idx))  # index=2 would set only z, for example.
+				empty.location = mathutils.Vector(marker.poses[0].position) / 1000.0 # Scale back to meters.
+				empty.keyframe_insert(data_path="location", frame=int(frame_idx))  # index=2 would set only z, for example.
 				empty.rotation_quaternion = mat3_to_quaternion(marker.poses[0].rotation)
-				empty.keyframe_insert(data_path="rotation_quaternion", frame=float(frame_idx))
+				empty.keyframe_insert(data_path="rotation_quaternion", frame=int(frame_idx))
+				empty.bfm_detection_confidence = 1.0
+				empty.keyframe_insert(data_path='bfm_detection_confidence', frame=frame_idx)
+				empty.empty_display_size = config.marker_size_mm / 1000.0  # Again, mm to m.
+				empty.keyframe_insert(data_path='empty_display_size', frame=frame_idx)
+				visible_marker_ids.add(marker.marker_id)
+				all_marker_ids.add(marker.marker_id)
+
+				# Also keyframe detection confidence if we are seeing or lost this marker.
+
 				if config.origin_marker > 0 and marker.marker_id == config.origin_marker:
+					# TODO: Set camera transform.
 					pass
-			end_time = time.time()
-			delta_time = end_time - start_time
-			total_time += delta_time
-			self.report({'INFO'}, f" ... Done processeing frame {frame_idx} in {delta_time} seconds. Found/updated {len(detections)} markers.")
-			# TODO: Reverse the camera one.
+
+				# Possibly create tracking markers.
+				# See https://docs.blender.org/api/current/bpy.types.MovieTrackingMarkers.html and https://docs.blender.org/api/current/bpy.types.MovieTrackingMarker.html#bpy.types.MovieTrackingMarker
+				if config.generate_2d_tracks:
+					if config.empties_at_center:
+						pass  # TODO: Add the markers at the center instead of the top-left.
+					#bpy.ops.clip.add_marker_slide(CLIP_OT_add_marker={"location":(0.324317, 0.554497)}, TRANSFORM_OT_translate={"value":(0, 0, 0), "orient_type":'GLOBAL', "orient_matrix":((1, 0, 0), (0, 1, 0), (0, 0, 1)), "orient_matrix_type":'GLOBAL', "constraint_axis":(True, True, True), "mirror":False, "use_proportional_edit":False, "proportional_edit_falloff":'SMOOTH', "proportional_size":1, "use_proportional_connected":False, "use_proportional_projected":False, "snap":False, "snap_elements":{'INCREMENT'}, "use_snap_project":False, "snap_target":'CLOSEST', "use_snap_self":True, "use_snap_edit":True, "use_snap_nonedit":True, "use_snap_selectable":False, "snap_point":(0, 0, 0), "snap_align":False, "snap_normal":(0, 0, 0), "gpencil_strokes":False, "cursor_transform":False, "texture_space":False, "remove_on_cancel":False, "use_duplicated_keyframes":False, "view2d_edge_pan":False, "release_confirm":True, "use_accurate":False, "use_automerge_and_split":False})
+					#bpy.ops.clip.add_marker(location=(0.324317, 0.554497))
+			
+			# Now that we've done all the detections, we need to go over the unseen ones.
+			for mid in all_marker_ids:
+				if mid not in visible_marker_ids:
+					# We've seen this, but we didn't see it in the last frame, so mark as 'no detection'.
+					m = marker_id_to_empty[mid]
+					m.bfm_detection_confidence = 0.0
+					m.keyframe_insert(data_path='bfm_detection_confidence', frame=frame_idx)
+					m.empty_display_size = config.marker_size_mm / 10000.0 # mm to m / 10.  One TENTH the size in mm when not visible.
+					m.keyframe_insert(data_path='empty_display_size', frame=frame_idx)
+			# TODO: Go back over the first ones and insert the first frame where they're visible.
+
+			self.report({'INFO'}, f" ... Done processeing frame {frame_idx}. Found/updated {len(detections)} markers.")
+		
+		# Get the camera, invert its motion, and apply that to all the other markers.
+		if config.origin_marker > 0:
+
+			origin_marker = marker_id_to_empty.get(config.origin_marker)
+			# No need to do an indirect with `camera = bpy.data.objects.get()`, but camera = config.camera_to_bake doesn't give us translation props.
+			if config.camera_to_bake:
+				camera = context.scene.objects[config.camera_to_bake.name]
+				if camera is None:
+					self.report({'WARNING'}, "Camera to bake was set but could not be found in the scene. This shouldn't happen.")
+				else:
+					camera.rotation_mode = 'QUATERNION'
+			else:
+				camera = None
+			
+			if origin_marker is None:
+				self.report({'WARNING'}, "Origin marker was set but the fiducial could not be located in the scene. Not baking.")
+			else:
+				self.report({'INFO'}, "Applying origin marker root motion.")
+				for frame_idx in range(clip.frame_start, clip.frame_duration):
+					context.scene.frame_set(frame_idx)
+					# A note on applying the transform:
+					# When the origin marker isn't visible to us, we still use the interpolated position to invert OTHER KEYFRAMED MARKERS.
+					# We do NOT insert keyframes for the camera, however.
+					inverse_rotation = origin_marker.rotation_quaternion.inverted()
+					inverse_translation = origin_marker.location * -1.0
+					# Apply the inverse transform to all markers currently keyframed.
+					for m in all_marker_ids:
+						to_transform = marker_id_to_empty[m]
+						if to_transform.bfm_detection_confidence == 1.0:
+							to_transform.rotation_quaternion.rotate(inverse_rotation)
+							to_transform.keyframe_insert(data_path="rotation_quaternion", frame=int(frame_idx))
+							to_transform.location += inverse_translation
+							to_transform.keyframe_insert(data_path="location", frame=int(frame_idx))  # index=2 would set only z, for example.
+					# Also apply to the camera if the marker is visible.
+					if camera and origin_marker.bfm_detection_confidence == 1.0:
+						camera.rotation_quaternion.rotate(inverse_rotation)
+						camera.keyframe_insert(data_path="rotation_quaternion", frame=frame_idx)
+						camera.location = inverse_translation
+						camera.keyframe_insert(data_path="location", frame=frame_idx)
 
 		self.report({'INFO'}, "Finished reading fiducials.")
 		return {'FINISHED'}
@@ -289,11 +358,15 @@ def register():
 	#BFM_PGT_TrackingConfiguration.register() # Register class calls the interal classmethod?
 	for c in classes: 
 		bpy.utils.register_class(c)
+	# Also register a custom type for objects.  
+	# TODO: Can we do this only for empties or does the custom property need to apply to all objects?
+	bpy.types.Object.bfm_detection_confidence = bpy.props.FloatProperty(name="BFM Detection Confidence")
 	print("Done")
 
 
 def unregister():
 	print("Unregistering")
+	del bpy.types.Object.bfm_detection_confidence
 	for c in reversed(classes):
 		bpy.utils.unregister_class(c)
 	print("Done")
