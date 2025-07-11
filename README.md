@@ -27,9 +27,19 @@ bfm.main()
 
 3. Run the script by pressing the 'play' button.
 
-4. Move to the motion tracking workspace and open a movie clip.  It can be useful to press "Set Scene Frames" under "Clip" so that your timeline has the same number of frames as your video.  It may also be useful to reset your camera's position and rotation (Alt+G, Alt+R).
+## Usage Instructions:
 
-5. Under the 'Track' menu, you'll find there's a new section: "Fiducial Markers".  Set your focal distance, marker size, marker type, and other parameters.  Finally, when you're ready, you can press "Run Tracking".  Blender will seem to lock up while the frames are being processed, but eventually you'll end up with a series of animated markers in your collection.
+1. Open the motion tracking workspace and load a movie clip.  
+
+1a. It can be useful to press "Set Scene Frames" under "Clip" so that your timeline has the same number of frames as your video.  
+
+1b. It may also be useful to reset your camera's position and rotation (Alt+G, Alt+R).
+
+2. Under the 'Track' menu, find there's a new section: "Fiducial Markers".  
+
+3. Set your focal distance, marker size, marker type, and other parameters.  
+
+4. Finally, when you're ready, you can press "Run Tracking".  Blender will seem to lock up while the frames are being processed, but eventually you'll end up with a series of animated markers in your collection.
 
 ## Known Bugs and Limitations:
 
