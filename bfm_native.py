@@ -32,7 +32,6 @@ class FiducialMarkerDetectorNative:
 	
 	#@overrides
 	def detect_markers(self, filepath: str) -> list[tuple[int, list[MarkerDetection]]]:
-		# return super().detect_markers(image_array)
 		video = cv2.VideoCapture(filepath)
 		
 		intrinsics = None
@@ -86,6 +85,8 @@ class FiducialMarkerDetectorNative:
 				# Convert rotation vector to a rotation matrix with the Rodrigues op: https://docs.opencv.org/4.11.0/d9/d0c/group__calib3d.html#ga61585db663d9da06b68e70cfbf6a1eac
 				# OpenCV uses the compact Rodriguez representation for rotations, similar to axis-angle [theta, x, y, z], but where theta = sqrt(x^2 + y^2 + z^2) and axis = [x/theta, y/theta, z/theta]
 				# See https://stackoverflow.com/questions/12933284/rodrigues-into-eulerangles-and-vice-versa
+				# Blender uses a right-handed +Z up coordinate system.
+				# OpenCV uses a right-handed +Z forward coordinate system.
 				rot, _jacobian = cv2.Rodrigues(rotation)
 
 				# Transforms points from the _model coordinate system_ to the _camera coordinate system_.
